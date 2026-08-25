@@ -2,3 +2,5 @@
 /src/
 *.mo
 *.pkg.tar.*
+__pycache__/
+*.pyc
