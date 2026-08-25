@@ -1,105 +1,119 @@
-# fprintd en_US Prompt Override
+# fprintd Custom Prompt
 
-An Arch Linux package that changes this `pam_fprintd` prompt:
-
-```text
-Place your right index finger on the fingerprint reader
-```
-
-to:
-
-```text
-Touch the fingerprint reader
-```
-
-The package installs an `en_US` gettext catalog. It does not replace
-`pam_fprintd.so`, change fingerprint selection, or modify authentication logic.
-
-## Requirements
-
-- Arch Linux
-- `fprintd`
-- An `en_US.UTF-8` message locale in the application invoking PAM
-- The standard Arch package build tools
-
-## Build
-
-Review `PKGBUILD` and `fprintd.po`, then build the package:
+Set a custom fingerprint reader prompt for `pam_fprintd`. One command to
+change what appears when your laptop asks you to touch the fingerprint sensor.
 
 ```bash
-makepkg -f
+sudo fprintd-prompt set "Touch the sensor 🔐"
 ```
 
-Building does not install anything or require root privileges. The resulting
-package is:
+The utility generates a GNU gettext catalog that overrides `pam_fprintd`'s
+`en_US` messages. 
 
-```text
-fprintd-en-us-prompt-override-1-1-any.pkg.tar.zst
-```
+## Installation
 
-## Inspect
-
-List the files that the package would install:
+Build and install the Arch package:
 
 ```bash
-pacman -Qlp fprintd-en-us-prompt-override-1-1-any.pkg.tar.zst
+git clone https://github.com/Walentalien/fprintd-en-us-prompt-override
+cd fprintd-en-us-prompt-override
+makepkg -si
 ```
 
-The only payload should be:
+## Usage
 
-```text
+```bash
+# Set a custom prompt
+sudo fprintd-prompt set "Touch the sensor"
+
+# View the current prompt
+fprintd-prompt get
+
+# Show diagnostic status
+fprintd-prompt status
+
+# Rebuild the catalog (e.g. after a package upgrade)
+sudo fprintd-prompt apply
+
+# Remove the custom prompt and restore upstream defaults
+sudo fprintd-prompt reset
+```
+
+Unicode, quotes, backslashes, emoji, and `%` are all supported:
+
+```bash
+sudo fprintd-prompt set "Authenticate 🔐 — 100% Linux"
+sudo fprintd-prompt set 'He said "touch the sensor"'
+sudo fprintd-prompt set "Zażółć gęślą jaźń"
+sudo fprintd-prompt set -- "-scan me"
+```
+
+## How it works
+
+`pam_fprintd` uses GNU gettext to look up the `en_US` translation of its
+fingerprint prompt messages. This package installs a symlink:
+
+```
 /usr/share/locale/en_US/LC_MESSAGES/fprintd.mo
+  -> /var/lib/fprintd-custom-prompt/fprintd.mo
 ```
 
-Inspect the compiled message catalog:
+When you run `fprintd-prompt set`, the tool:
 
-```bash
-msgunfmt src/fprintd.mo
-```
+1. Validates the prompt text.
+2. Generates a `.po` file covering all 44 upstream initial prompt variants
+   (place/swipe × 11 finger labels × generic/specific).
+3. Compiles it with `msgfmt` into a `.mo` catalog.
+4. Saves the prompt to `/etc/fprintd-custom-prompt.conf`.
+5. Atomically installs the catalog.
 
-## Install
+Authentication behavior is completely unchanged. Only the displayed text
+is affected.
 
-Install the built package with Pacman:
+## Locale caveat
 
-```bash
-sudo pacman -U ./fprintd-en-us-prompt-override-1-1-any.pkg.tar.zst
-```
+Gettext ignores translation catalogs when the PAM application uses the `C`
+or `POSIX` locale. The locale of `sudo`, GDM, lock screens, etc. can differ
+from your terminal. Ensure your desktop session uses `en_US.UTF-8` for the
+override to take effect.
 
-Log out and back in before testing the prompt. Gettext intentionally ignores
-translation catalogs when the PAM application uses the `C` or `POSIX` locale.
-
-## Customize
-
-Edit the replacement in `fprintd.po`. Keep the `msgid` unchanged because it is
-the lookup key used by `pam_fprintd`; change only `msgstr`.
-
-After editing the catalog, generate its new checksum:
-
-```bash
-makepkg -g
-```
-
-Replace the `sha256sums` value in `PKGBUILD` with the generated value, then
-rebuild:
-
-```bash
-makepkg -f
-```
-
-## Remove
-
-```bash
-sudo pacman -Rns fprintd-en-us-prompt-override
-```
-
-Removing the package removes the custom catalog, so gettext falls back to the
-original message built into `pam_fprintd`.
+Run `fprintd-prompt status` to check your locale settings.
 
 ## Compatibility
 
-The override matches an exact upstream English `msgid`. If fprintd changes that
-source message in a future release, authentication will continue to work, but
-the original upstream wording will be displayed until `fprintd.po` is updated.
+The utility relies on exact upstream gettext `msgid` strings from:
+
+[fingerprint-strings.h](https://github.com/FrameworkComputer/fprintd/blob/master/pam/fingerprint-strings.h)
+
+If upstream changes these strings in a future release, authentication will
+still work, but the custom prompt may not appear until the utility is updated
+with the new identifiers.
+
+## Uninstall
+
+```bash
+sudo pacman -Rns fprintd-custom-prompt
+```
+
+This removes the package, the symlink, and the generated catalog. Upstream
+prompt behavior is immediately restored. The configuration file
+`/etc/fprintd-custom-prompt.conf` is preserved; remove it manually if desired.
+
+## Troubleshooting
+
+Run the diagnostic command first:
+
+```bash
+fprintd-prompt status
+```
+
+Common issues:
+
+- **Locale warning**: Your shell or PAM session may be using `C` or `POSIX`.
+  Set `LANG=en_US.UTF-8` in your environment.
+- **Gettext link missing**: Reinstall the package or run
+  `sudo fprintd-prompt apply`.
+- **Catalog missing but config present**: Run `sudo fprintd-prompt apply`.
 
 ## License
 
