@@ -100,3 +100,9 @@ original message built into `pam_fprintd`.
 The override matches an exact upstream English `msgid`. If fprintd changes that
 source message in a future release, authentication will continue to work, but
 the original upstream wording will be displayed until `fprintd.po` is updated.
+
+## License
+
+This project is released into the public domain under
+[CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/).
+See [LICENSE](LICENSE) for the full text.
