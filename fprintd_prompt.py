@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""fprintd-prompt — CLI to set a custom pam_fprintd authentication prompt.
+
+Overrides the en_US gettext messages used by pam_fprintd so that the
+fingerprint reader prompt displays user-chosen text instead of the
+upstream default.
+
+The core technique (GNU gettext catalog override) is unchanged;
+this tool simply automates PO generation, compilation, and
+symlink management so the user never edits files manually.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gettext
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+__version__ = "2.0.0"
+
+# ---------------------------------------------------------------------------
+# Fixed system paths (production)
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = Path("/etc/fprintd-custom-prompt.conf")
+STATE_DIR = Path("/var/lib/fprintd-custom-prompt")
+CATALOG_PATH = STATE_DIR / "fprintd.mo"
+SYSTEM_CATALOG_PATH = Path("/usr/share/locale/en_US/LC_MESSAGES/fprintd.mo")
+
+# ---------------------------------------------------------------------------
+# Upstream fprintd initial-prompt msgids (from fingerprint-strings.h)
+# ---------------------------------------------------------------------------
+
+FINGERS = [
+    "finger",
+    "left thumb",
+    "left index finger",
+    "left middle finger",
+    "left ring finger",
+    "left little finger",
+    "right thumb",
+    "right index finger",
+    "right middle finger",
+    "right ring finger",
+    "right little finger",
+]
+
+PLACE_GENERIC = "Place your {finger} on the fingerprint reader"
+PLACE_SPECIFIC = "Place your {finger} on %s"
+SWIPE_GENERIC = "Swipe your {finger} across the fingerprint reader"
+SWIPE_SPECIFIC = "Swipe your {finger} across %s"
+
+TEMPLATES = [PLACE_GENERIC, PLACE_SPECIFIC, SWIPE_GENERIC, SWIPE_SPECIFIC]
+
+
+def build_initial_msgids() -> list[str]:
+    """Return the 44 upstream initial-prompt msgid strings."""
+    msgids: list[str] = []
+    for finger in FINGERS:
+        for tmpl in TEMPLATES:
+            msgids.append(tmpl.format(finger=finger))
+    return msgids
+
+
+INITIAL_MSGIDS = build_initial_msgids()
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+_MAX_PROMPT_BYTES = 4096
+
+# Control characters we reject (NUL, CR, LF, and other C0/C1 controls).
+# Tab (0x09) is allowed since some terminals use it.
+_CONTROL_CHAR_RE = re.compile(
+    r"[\x00-\x08\x0a-\x1f\x7f\x80-\x9f]"
+)
+
+
+def validate_prompt(prompt: str) -> None:
+    """Raise ValueError if *prompt* is not a usable PAM prompt."""
+    if not prompt:
+        raise ValueError("Prompt must not be empty.")
+    if _CONTROL_CHAR_RE.search(prompt):
+        raise ValueError(
+            "Prompt contains control characters (NUL, newline, "
+            "carriage return, etc.) which are not allowed."
+        )
+    encoded = prompt.encode("utf-8")
+    if len(encoded) > _MAX_PROMPT_BYTES:
+        raise ValueError(
+            f"Prompt is {len(encoded)} UTF-8 bytes; "
+            f"maximum is {_MAX_PROMPT_BYTES}."
+        )
+
+
+# ---------------------------------------------------------------------------
+# PO string escaping
+# ---------------------------------------------------------------------------
+
+def po_quote(text: str) -> str:
+    """Escape *text* for inclusion inside a PO double-quoted string.
+
+    Handles backslashes and double-quotes.  Newlines are not expected
+    (they are rejected during validation).
+    """
+    text = text.replace("\\", "\\\\")
+    text = text.replace('"', '\\"')
+    return text
+
+
+# ---------------------------------------------------------------------------
+# PO generation
+# ---------------------------------------------------------------------------
+
+def printf_safe_translation(prompt: str, *, is_device_specific: bool) -> str:
+    """Build a msgstr that is safe for C ``asprintf`` consumption.
+
+    For device-specific messages the upstream code does:
+        asprintf(&s, translated_message, driver_name);
+
+    We must ensure the user's literal ``%`` never becomes a printf
+    directive while still consuming the required *driver_name* argument.
+
+    Strategy:
+    - Escape every ``%`` as ``%%``.
+    - Append ``%.0s`` to silently consume the driver-name string.
+    """
+    escaped = prompt.replace("%", "%%")
+    if is_device_specific:
+        escaped += "%.0s"
+    return escaped
+
+
+def render_po(prompt: str) -> str:
+    """Return a complete PO file body for the 44 upstream msgids."""
+    lines: list[str] = []
+    lines.append('msgid ""')
+    lines.append('msgstr ""')
+    lines.append('"Project-Id-Version: fprintd-custom-prompt\\n"')
+    lines.append('"Language: en_US\\n"')
+    lines.append('"MIME-Version: 1.0\\n"')
+    lines.append('"Content-Type: text/plain; charset=UTF-8\\n"')
+    lines.append('"Content-Transfer-Encoding: 8bit\\n"')
+
+    for msgid in INITIAL_MSGIDS:
+        is_device_specific = "%s" in msgid
+        trans = printf_safe_translation(prompt, is_device_specific=is_device_specific)
+        lines.append("")
+        if is_device_specific:
+            lines.append("#, c-format")
+        lines.append(f'msgid "{po_quote(msgid)}"')
+        lines.append(f'msgstr "{po_quote(trans)}"')
+
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# File I/O helpers
+# ---------------------------------------------------------------------------
+
+def _atomic_write(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """Write *data* to *path* atomically via a temporary file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        os.write(fd, data)
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+        os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Catalog compilation
+# ---------------------------------------------------------------------------
+
+def compile_catalog(po_text: str, output: Path) -> None:
+    """Compile *po_text* into a .mo file at *output* using msgfmt."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, po_tmp = tempfile.mkstemp(suffix=".po")
+    try:
+        os.write(fd, po_text.encode("utf-8"))
+        os.close(fd)
+        subprocess.run(
+            ["msgfmt", "--check", "--check-format", po_tmp, "-o", str(output)],
+            check=True,
+            capture_output=True,
+        )
+    finally:
+        try:
+            os.unlink(po_tmp)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+def read_config(config_path: Path = CONFIG_PATH) -> str | None:
+    """Return the configured prompt, or None if no config exists."""
+    if not config_path.is_file():
+        return None
+    text = config_path.read_text(encoding="utf-8").strip()
+    return text if text else None
+
+
+def write_config(prompt: str, config_path: Path = CONFIG_PATH) -> None:
+    """Atomically write the prompt to the configuration file."""
+    _atomic_write(config_path, prompt.encode("utf-8") + b"\n", mode=0o644)
+
+
+# ---------------------------------------------------------------------------
+# High-level operations
+# ---------------------------------------------------------------------------
+
+def apply_prompt(
+    prompt: str | None = None,
+    *,
+    config_path: Path = CONFIG_PATH,
+    catalog_path: Path = CATALOG_PATH,
+) -> str:
+    """Generate the .mo catalog from the stored or supplied prompt.
+
+    Returns a status message.
+    """
+    if prompt is None:
+        prompt = read_config(config_path)
+    if prompt is None:
+        return "No custom prompt is configured. Nothing to apply."
+
+    po_text = render_po(prompt)
+    compile_catalog(po_text, catalog_path)
+    return f"Custom prompt applied: {prompt}"
+
+
+def reset_prompt(
+    *,
+    config_path: Path = CONFIG_PATH,
+    catalog_path: Path = CATALOG_PATH,
+    state_dir: Path = STATE_DIR,
+) -> str:
+    """Remove configuration and generated catalog. Idempotent."""
+    removed: list[str] = []
+    for p in (config_path, catalog_path):
+        try:
+            p.unlink()
+            removed.append(str(p))
+        except FileNotFoundError:
+            pass
+    if state_dir.is_dir() and not any(state_dir.iterdir()):
+        try:
+            state_dir.rmdir()
+            removed.append(str(state_dir))
+        except OSError:
+            pass
+    if removed:
+        return "Removed: " + ", ".join(removed)
+    return "Nothing to remove."
+
+
+def inspect_status(
+    *,
+    config_path: Path = CONFIG_PATH,
+    catalog_path: Path = CATALOG_PATH,
+    system_catalog_path: Path = SYSTEM_CATALOG_PATH,
+) -> dict[str, str]:
+    """Gather diagnostic status information."""
+    info: dict[str, str] = {}
+
+    prompt = read_config(config_path)
+    info["Custom prompt"] = prompt if prompt else "disabled"
+    info["Prompt"] = prompt if prompt else "(none)"
+    info["Config"] = "present" if config_path.is_file() else "missing"
+    info["Catalog"] = "present" if catalog_path.is_file() else "missing"
+
+    # Symlink check
+    if system_catalog_path.is_symlink():
+        target = os.readlink(system_catalog_path)
+        if target == str(catalog_path):
+            info["Gettext link"] = "OK"
+        else:
+            info["Gettext link"] = f"wrong target ({target})"
+    elif system_catalog_path.exists():
+        info["Gettext link"] = "exists (not a symlink)"
+    else:
+        info["Gettext link"] = "missing"
+
+    # Shell locale
+    lang = os.environ.get("LANG", "")
+    lc_all = os.environ.get("LC_ALL", "")
+    effective = lc_all if lc_all else lang
+    info["Current shell locale"] = effective if effective else "(unset)"
+
+    if effective in ("C", "POSIX", "C.UTF-8", ""):
+        info["Locale warning"] = (
+            "The current shell locale is not en_US. Gettext may ignore "
+            "the catalog. The PAM application's locale can differ from "
+            "this shell."
+        )
+
+    # Verify the catalog actually translates a representative message
+    if catalog_path.is_file():
+        try:
+            with open(catalog_path, "rb") as fh:
+                t = gettext.GNUTranslations(fh)
+            test_msg = t.gettext(
+                "Place your right index finger on the fingerprint reader"
+            )
+            if test_msg == prompt:
+                info["Catalog verification"] = "OK — translates correctly"
+            else:
+                info["Catalog verification"] = (
+                    f"unexpected translation: {test_msg!r}"
+                )
+        except Exception as exc:
+            info["Catalog verification"] = f"error: {exc}"
+    elif prompt:
+        info["Catalog verification"] = "catalog missing but config present"
+
+    # en_US.UTF-8 availability
+    try:
+        result = subprocess.run(
+            ["locale", "-a"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        locales = result.stdout.strip().splitlines()
+        if "en_US.UTF-8" in locales:
+            info["en_US.UTF-8 locale"] = "available"
+        else:
+            info["en_US.UTF-8 locale"] = (
+                "not found — the PAM application may not see translations"
+            )
+    except Exception:
+        info["en_US.UTF-8 locale"] = "could not determine"
+
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="fprintd-prompt",
+        description="Set a custom pam_fprintd fingerprint prompt.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    p_set = sub.add_parser("set", help="Set the custom prompt text.")
+    p_set.add_argument("prompt", help="The prompt text to display.")
+
+    sub.add_parser("get", help="Show the currently configured prompt.")
+    sub.add_parser("apply", help="Rebuild the catalog from the saved config.")
+    sub.add_parser("reset", help="Remove the custom prompt and restore defaults.")
+    sub.add_parser("status", help="Show diagnostic status information.")
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Root check
+# ---------------------------------------------------------------------------
+
+def _require_root() -> None:
+    if os.geteuid() != 0:
+        print("Error: this command must be run as root.", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
+
+    if args.command == "get":
+        prompt = read_config()
+        if prompt is None:
+            print("No custom prompt is configured.", file=sys.stderr)
+            sys.exit(1)
+        print(prompt)
+        return
+
+    if args.command == "status":
+        for key, value in inspect_status().items():
+            print(f"{key}: {value}")
+        return
+
+    # Commands below require root
+    _require_root()
+
+    if args.command == "set":
+        prompt = args.prompt
+        validate_prompt(prompt)
+        # Compile first before committing
+        po_text = render_po(prompt)
+        compile_catalog(po_text, CATALOG_PATH)
+        write_config(prompt)
+        print(f"Custom prompt set: {prompt}")
+        return
+
+    if args.command == "apply":
+        result = apply_prompt()
+        print(result)
+        return
+
+    if args.command == "reset":
+        result = reset_prompt()
+        print(result)
+        return
+
+
+if __name__ == "__main__":
+    main()

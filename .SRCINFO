@@ -1,0 +1,18 @@
+pkgbase = fprintd-custom-prompt
+	pkgdesc = CLI to set a custom pam_fprintd authentication prompt
+	pkgver = 2.0.0
+	pkgrel = 1
+	url = https://github.com/Walentalien/fprintd-en-us-prompt-override
+	install = fprintd-custom-prompt.install
+	arch = any
+	license = CC0-1.0
+	depends = fprintd
+	depends = gettext
+	depends = python
+	provides = fprintd-en-us-prompt-override
+	conflicts = fprintd-en-us-prompt-override
+	replaces = fprintd-en-us-prompt-override
+	source = fprintd_prompt.py
+	sha256sums = 7ff7ad2d9f26459c8c0dd271f55777e071e4641da4419e3d7fb70fa735b1cbda
+
+pkgname = fprintd-custom-prompt
