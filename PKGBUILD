@@ -12,7 +12,7 @@ conflicts=('fprintd-en-us-prompt-override')
 replaces=('fprintd-en-us-prompt-override')
 install=fprintd-custom-prompt.install
 source=('fprintd_prompt.py')
-sha256sums=('7ff7ad2d9f26459c8c0dd271f55777e071e4641da4419e3d7fb70fa735b1cbda')
+sha256sums=('a4b4ba2ee29cf06c0a07194f1babd527d93387e18a056cf76bf321b14b417e6b')
 
 package() {
     install -Dm755 "$srcdir/fprintd_prompt.py" \

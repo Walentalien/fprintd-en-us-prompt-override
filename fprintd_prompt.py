@@ -169,10 +169,12 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
-        os.write(fd, data)
-        os.fchmod(fd, mode)
-        os.fsync(fd)
-        os.close(fd)
+        try:
+            os.write(fd, data)
+            os.fchmod(fd, mode)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -187,22 +189,30 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o644) -> None:
 # ---------------------------------------------------------------------------
 
 def compile_catalog(po_text: str, output: Path) -> None:
-    """Compile *po_text* into a .mo file at *output* using msgfmt."""
+    """Compile *po_text* into a .mo file at *output* atomically using msgfmt."""
     output.parent.mkdir(parents=True, exist_ok=True)
-    fd, po_tmp = tempfile.mkstemp(suffix=".po")
+    fd_po, po_tmp = tempfile.mkstemp(suffix=".po")
+    fd_mo, mo_tmp = tempfile.mkstemp(dir=output.parent, suffix=".mo.tmp")
+    os.close(fd_mo)
     try:
-        os.write(fd, po_text.encode("utf-8"))
-        os.close(fd)
+        try:
+            os.write(fd_po, po_text.encode("utf-8"))
+        finally:
+            os.close(fd_po)
         subprocess.run(
-            ["msgfmt", "--check", "--check-format", po_tmp, "-o", str(output)],
+            ["msgfmt", "--check", "--check-format", po_tmp, "-o", mo_tmp],
             check=True,
             capture_output=True,
+            text=True,
         )
+        os.chmod(mo_tmp, 0o644)
+        os.replace(mo_tmp, output)
     finally:
-        try:
-            os.unlink(po_tmp)
-        except OSError:
-            pass
+        for tmp in (po_tmp, mo_tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -298,10 +308,11 @@ def inspect_status(
     else:
         info["Gettext link"] = "missing"
 
-    # Shell locale
+    # Shell locale (POSIX hierarchy: LC_ALL > LC_MESSAGES > LANG)
     lang = os.environ.get("LANG", "")
+    lc_messages = os.environ.get("LC_MESSAGES", "")
     lc_all = os.environ.get("LC_ALL", "")
-    effective = lc_all if lc_all else lang
+    effective = lc_all if lc_all else (lc_messages if lc_messages else lang)
     info["Current shell locale"] = effective if effective else "(unset)"
 
     if effective in ("C", "POSIX", "C.UTF-8", ""):
@@ -414,25 +425,39 @@ def main(argv: list[str] | None = None) -> None:
     # Commands below require root
     _require_root()
 
-    if args.command == "set":
-        prompt = args.prompt
-        validate_prompt(prompt)
-        # Compile first before committing
-        po_text = render_po(prompt)
-        compile_catalog(po_text, CATALOG_PATH)
-        write_config(prompt)
-        print(f"Custom prompt set: {prompt}")
-        return
+    try:
+        if args.command == "set":
+            prompt = args.prompt
+            validate_prompt(prompt)
+            # Compile first before committing
+            po_text = render_po(prompt)
+            compile_catalog(po_text, CATALOG_PATH)
+            write_config(prompt)
+            print(f"Custom prompt set: {prompt}")
+            return
 
-    if args.command == "apply":
-        result = apply_prompt()
-        print(result)
-        return
+        if args.command == "apply":
+            result = apply_prompt()
+            print(result)
+            return
 
-    if args.command == "reset":
-        result = reset_prompt()
-        print(result)
-        return
+        if args.command == "reset":
+            result = reset_prompt()
+            print(result)
+            return
+    except FileNotFoundError as exc:
+        if exc.filename == "msgfmt" or "msgfmt" in str(exc):
+            print("Error: 'msgfmt' command not found. Please install gettext.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Error: file not found: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        err = exc.stderr.strip() if exc.stderr else str(exc)
+        print(f"Error compiling catalog: {err}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
